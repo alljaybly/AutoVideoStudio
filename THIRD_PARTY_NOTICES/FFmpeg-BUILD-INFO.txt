@@ -1,0 +1,27 @@
+AutoVideoStudio - Third-Party Build Information
+
+Component: FFmpeg (includes ffmpeg.exe and ffprobe.exe)
+Build provider: Gyan Doshi, gyan.dev
+Build version: 2026-10-15-git-afead44165-essentials_build-www.gyan.dev
+FFmpeg source commit: afead44165
+
+License:
+This FFmpeg build is licensed under the GNU General Public License version 3 or later (GPLv3+).
+The build was configured with --enable-gpl and --enable-version3, and includes GPL-compatible external libraries such as libx264 and libx265.
+
+Source Code:
+The complete corresponding source code for this exact FFmpeg build is included in this distribution at:
+THIRD_PARTY_NOTICES/FFmpeg-source-afead44165.zip
+
+A copy of the source code is also available online at:
+https://github.com/FFmpeg/FFmpeg/archive/afead44165.zip
+
+License Text:
+The full text of the GNU General Public License version 3 is included in this distribution at:
+THIRD_PARTY_NOTICES/GPL-3.0.txt
+
+Build Information Source:
+https://www.gyan.dev/ffmpeg/builds/
+
+FFmpeg Legal Information:
+https://ffmpeg.org/legal.html
