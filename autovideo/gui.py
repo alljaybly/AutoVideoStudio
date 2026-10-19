@@ -10,8 +10,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from .editing import EditProposal, EditRequestError, next_version_path, parse_edit_request
-from .engine import (Cancelled, MediaItem, RenderError, RenderOptions, Renderer,
-                     find_tools, make_logger, output_path)
+from .engine import (Cancelled, MediaItem, Overlay, RenderError, RenderOptions,
+                     Renderer, Transition, find_tools, make_logger, output_path)
 from .preview import PreviewPathError, existing_mp4_path
 
 
@@ -50,6 +50,22 @@ class Studio:
         self.aspect = tk.StringVar(value='landscape')
         self.seconds = tk.StringVar(value='5')
         self.volume = tk.StringVar(value='22')
+        # Transitions
+        self.transition_type = tk.StringVar(value='cut')
+        self.transition_duration = tk.StringVar(value='1.0')
+        # Timed text overlays
+        self.overlay_enabled = tk.BooleanVar(value=False)
+        self.overlay_text = tk.StringVar(value='')
+        self.overlay_start = tk.StringVar(value='0')
+        self.overlay_end = tk.StringVar(value='5')
+        self.overlay_font_size = tk.StringVar(value='24')
+        self.overlay_color = tk.StringVar(value='#FFFFFF')
+        self.overlay_position = tk.StringVar(value='bottom')
+        self.overlay_background = tk.BooleanVar(value=True)
+        # Audio ducking
+        self.ducking_enabled = tk.BooleanVar(value=False)
+        self.ducking_strength = tk.StringVar(value='0.30')
+        self.ducking_threshold = tk.StringVar(value='-30')
         self.status = tk.StringVar(value='Ready — add visuals; narration and music are optional.')
         self.progress_text = tk.StringVar(value='No job running')
         self.output_path_text = tk.StringVar(value='No verified rendered output yet.')
@@ -65,15 +81,47 @@ class Studio:
         ttk.Label(header, text='OFFLINE VIDEO WORKSPACE     •     CPU RENDERING     •     24 FPS',
                   style='Eyebrow.TLabel').pack(anchor='w', pady=(4, 0))
 
-        media_card = ttk.LabelFrame(frame, text='  01  VISUAL SEQUENCE  ', style='Section.TLabelframe', padding=8)
-        media_card.grid(row=1, column=0, sticky='nsew', pady=(0, 5))
+        # --- Scrollable content area (sections 01-05) -----------------------
+        scroll_container = ttk.Frame(frame, style='App.TFrame')
+        scroll_container.grid(row=1, column=0, sticky='nsew')
+        scroll_container.columnconfigure(0, weight=1)
+        scroll_container.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(scroll_container, bg='#0b1116', highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky='nsew')
+
+        scrollbar = ttk.Scrollbar(scroll_container, orient='vertical', command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky='ns')
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        content = ttk.Frame(canvas, style='App.TFrame')
+        canvas_window = canvas.create_window((0, 0), window=content, anchor='nw')
+
+        content.columnconfigure(0, weight=1)
+
+        def _configure_content(event):
+            canvas.configure(scrollregion=canvas.bbox('all'))
+        content.bind('<Configure>', _configure_content)
+
+        def _configure_canvas(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+        canvas.bind('<Configure>', _configure_canvas)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+        canvas.bind('<Enter>', lambda e: canvas.bind_all('<MouseWheel>', _on_mousewheel))
+        canvas.bind('<Leave>', lambda e: canvas.unbind_all('<MouseWheel>'))
+
+        media_card = ttk.LabelFrame(content, text='  01  VISUAL SEQUENCE  ', style='Section.TLabelframe', padding=8)
+        media_card.grid(row=0, column=0, sticky='ew', pady=(0, 5))
         media_card.columnconfigure(0, weight=1)
         media_card.rowconfigure(1, weight=1)
         ttk.Label(media_card, text='Add clips and still images, then arrange their playback order.',
                   style='Muted.TLabel').grid(row=0, column=0, sticky='w', pady=(0, 4))
         media = ttk.Frame(media_card, style='Card.TFrame')
         media.grid(row=1, column=0, sticky='nsew')
-        media.grid_propagate(False)
+
         media.columnconfigure(0, weight=1)
         media.rowconfigure(0, weight=1)
         self.listbox = tk.Listbox(media, height=3, selectmode='browse', exportselection=False,
@@ -97,7 +145,21 @@ class Studio:
                                ('Move up', lambda: self.move(-1)), ('Move down', lambda: self.move(1)), ('Remove', self.remove)]:
             self.button(buttons, title, command).pack(side='left', padx=(0, 7))
 
-        lower = ttk.Frame(frame, style='App.TFrame')
+        # --- Transitions panel ------------------------------------------------
+        trans_panel = ttk.LabelFrame(content, text='  02  VISUAL TRANSITIONS  ', style='Section.TLabelframe', padding=7)
+        trans_panel.grid(row=1, column=0, sticky='ew', pady=(5, 0))
+        trans_panel.columnconfigure(1, weight=1)
+        ttk.Label(trans_panel, text='Type', style='Field.TLabel').grid(row=0, column=0, sticky='w', pady=(2, 1))
+        trans_type = ttk.Combobox(trans_panel, textvariable=self.transition_type,
+                                  values=['cut', 'crossfade', 'fade_to_black'], state='readonly', width=14)
+        trans_type.grid(row=0, column=1, sticky='w', padx=8, pady=(2, 1))
+        self.controls.append(trans_type)
+        ttk.Label(trans_panel, text='Duration (seconds)', style='Field.TLabel').grid(row=0, column=2, sticky='w', pady=(2, 1))
+        self.entry(trans_panel, self.transition_duration, 8).grid(row=0, column=3, sticky='w', padx=8, pady=(2, 1))
+        ttk.Label(trans_panel, text='Applied between every visual gap. Cut = instant switch.', style='Muted.TLabel').grid(row=0, column=4, sticky='w', pady=(2, 1))
+        ttk.Label(trans_panel, text='Crossfade blends frames; fade-to-black dips through black.', style='Muted.TLabel').grid(row=1, column=0, columnspan=5, sticky='w', pady=(0, 2))
+
+        lower = ttk.Frame(content, style='App.TFrame')
         lower.grid(row=2, column=0, sticky='ew')
         lower.columnconfigure(0, weight=1, uniform='panels')
         lower.columnconfigure(1, weight=1, uniform='panels')
@@ -112,6 +174,15 @@ class Studio:
         ttk.Label(audio_panel, text='Music gain', style='Field.TLabel').grid(row=3, column=0, sticky='w', pady=(6, 1))
         self.entry(audio_panel, self.volume, 6).grid(row=3, column=1, sticky='w', padx=8, pady=(6, 1))
         ttk.Label(audio_panel, text='%  ·  0–50%, default 22%', style='Muted.TLabel').grid(row=3, column=2, columnspan=2, sticky='w', pady=(6, 1))
+        # Audio ducking controls
+        self.ducking_check = ttk.Checkbutton(audio_panel, text='Auto-duck music under narration', variable=self.ducking_enabled)
+        self.ducking_check.grid(row=4, column=0, columnspan=4, sticky='w', pady=(8, 1))
+        ttk.Label(audio_panel, text='Duck to', style='Field.TLabel').grid(row=5, column=0, sticky='w', pady=(4, 1))
+        self.entry(audio_panel, self.ducking_strength, 6).grid(row=5, column=1, sticky='w', padx=8, pady=(4, 1))
+        ttk.Label(audio_panel, text='of music volume during speech  ·  0.05–0.90', style='Muted.TLabel').grid(row=5, column=2, columnspan=2, sticky='w', pady=(4, 1))
+        ttk.Label(audio_panel, text='Speech threshold', style='Field.TLabel').grid(row=6, column=0, sticky='w', pady=(4, 1))
+        self.entry(audio_panel, self.ducking_threshold, 6).grid(row=6, column=1, sticky='w', padx=8, pady=(4, 1))
+        ttk.Label(audio_panel, text='dB  ·  narration louder than this is treated as speech', style='Muted.TLabel').grid(row=6, column=2, columnspan=2, sticky='w', pady=(4, 1))
 
         output_panel = ttk.LabelFrame(lower, text='  03  OUTPUT  ', style='Section.TLabelframe', padding=7)
         output_panel.grid(row=0, column=1, sticky='nsew', padx=(6, 0))
@@ -134,8 +205,33 @@ class Studio:
         self.entry(output_panel, self.seconds, 6).grid(row=4, column=1, sticky='w', padx=8, pady=(3, 0))
         ttk.Label(output_panel, text='seconds per image', style='Muted.TLabel').grid(row=4, column=2, columnspan=2, sticky='w', pady=(3, 0))
 
-        edit_panel = ttk.LabelFrame(frame, text='  04  SUPPORTED EDITING COMMANDS  ', style='Section.TLabelframe', padding=6)
-        edit_panel.grid(row=3, column=0, sticky='ew', pady=(5, 0))
+        # --- Overlays panel ---------------------------------------------------
+        ovl_panel = ttk.LabelFrame(content, text='  04  TIMED TEXT OVERLAY  ', style='Section.TLabelframe', padding=7)
+        ovl_panel.grid(row=3, column=0, sticky='ew', pady=(5, 0))
+        ovl_panel.columnconfigure(3, weight=1)
+        self.overlay_check = ttk.Checkbutton(ovl_panel, text='Add timed text overlay', variable=self.overlay_enabled)
+        self.overlay_check.grid(row=0, column=0, sticky='w', pady=(2, 1))
+        ttk.Label(ovl_panel, text='Text', style='Field.TLabel').grid(row=0, column=1, sticky='w', pady=(2, 1), padx=(8, 0))
+        self.entry(ovl_panel, self.overlay_text, 24).grid(row=0, column=2, sticky='w', padx=8, pady=(2, 1))
+        ttk.Label(ovl_panel, text='Start', style='Field.TLabel').grid(row=0, column=3, sticky='w', pady=(2, 1))
+        self.entry(ovl_panel, self.overlay_start, 6).grid(row=0, column=4, sticky='w', padx=8, pady=(2, 1))
+        ttk.Label(ovl_panel, text='End', style='Field.TLabel').grid(row=0, column=5, sticky='w', pady=(2, 1))
+        self.entry(ovl_panel, self.overlay_end, 6).grid(row=0, column=6, sticky='w', padx=8, pady=(2, 1))
+        ttk.Label(ovl_panel, text='Size', style='Field.TLabel').grid(row=1, column=0, sticky='w', pady=(2, 1))
+        self.entry(ovl_panel, self.overlay_font_size, 6).grid(row=1, column=1, sticky='w', padx=8, pady=(2, 1))
+        ttk.Label(ovl_panel, text='Position', style='Field.TLabel').grid(row=1, column=2, sticky='w', pady=(2, 1))
+        ovl_pos = ttk.Combobox(ovl_panel, textvariable=self.overlay_position,
+                               values=['top', 'centre', 'bottom'], state='readonly', width=10)
+        ovl_pos.grid(row=1, column=3, sticky='w', padx=8, pady=(2, 1))
+        self.controls.append(ovl_pos)
+        self.overlay_bg_check = ttk.Checkbutton(ovl_panel, text='Background box', variable=self.overlay_background)
+        self.overlay_bg_check.grid(row=1, column=4, sticky='w', pady=(2, 1))
+        ttk.Label(ovl_panel, text='Color', style='Field.TLabel').grid(row=1, column=5, sticky='w', pady=(2, 1))
+        self.entry(ovl_panel, self.overlay_color, 10).grid(row=1, column=6, sticky='w', padx=8, pady=(2, 1))
+        ttk.Label(ovl_panel, text='Appears between start and end seconds (FFmpeg time). Enable to render.', style='Muted.TLabel').grid(row=2, column=0, columnspan=7, sticky='w', pady=(0, 2))
+
+        edit_panel = ttk.LabelFrame(content, text='  05  SUPPORTED EDITING COMMANDS  ', style='Section.TLabelframe', padding=6)
+        edit_panel.grid(row=4, column=0, sticky='ew', pady=(5, 0))
         edit_panel.columnconfigure(0, weight=1)
         ttk.Label(edit_panel, text='Describe one settings change. Review the proposal, then choose Apply Changes.',
                   style='Muted.TLabel').grid(row=0, column=0, columnspan=4, sticky='w', pady=(0, 2))
@@ -158,7 +254,7 @@ class Studio:
         self.apply_edit_button.configure(state='disabled')
 
         footer = ttk.Frame(frame, style='App.TFrame')
-        footer.grid(row=4, column=0, sticky='ew', pady=(5, 0))
+        footer.grid(row=2, column=0, sticky='ew', pady=(5, 0))
         footer.columnconfigure(0, weight=1)
         actions = ttk.Frame(footer, style='App.TFrame')
         actions.grid(row=0, column=0, sticky='ew')
@@ -457,12 +553,39 @@ class Studio:
         try:
             if not self.folder.get().strip():
                 raise RenderError('Choose an existing output folder.')
-            options = RenderOptions(tuple(self.items), Path(self.voice.get()).expanduser().resolve() if self.voice.get().strip() else None,
-                                    output_path(self.folder.get(), self.filename.get()),
-                                    Path(self.music.get()).expanduser().resolve() if self.music.get().strip() else None,
-                                    self.aspect.get(), float(self.seconds.get()), float(self.volume.get()) / 100)
+            # One transition per visual gap (N-1 transitions for N items).
+            transition_dur = float(self.transition_duration.get())
+            transitions = tuple(
+                Transition(self.transition_type.get(), transition_dur)
+                for _ in range(max(0, len(self.items) - 1))
+            )
+            overlays = ()
+            if self.overlay_enabled.get():
+                overlays = (
+                    Overlay(
+                        content=self.overlay_text.get().strip(),
+                        start=float(self.overlay_start.get()),
+                        end=float(self.overlay_end.get()),
+                        size=int(self.overlay_font_size.get()),
+                        color=self.overlay_color.get(),
+                        position=self.overlay_position.get(),
+                        background=bool(self.overlay_background.get()),
+                    ),
+                )
+            options = RenderOptions(
+                tuple(self.items),
+                Path(self.voice.get()).expanduser().resolve() if self.voice.get().strip() else None,
+                output_path(self.folder.get(), self.filename.get()),
+                Path(self.music.get()).expanduser().resolve() if self.music.get().strip() else None,
+                self.aspect.get(), float(self.seconds.get()), float(self.volume.get()) / 100,
+                transitions=transitions,
+                overlays=overlays,
+                ducking=bool(self.ducking_enabled.get()),
+                ducking_strength=float(self.ducking_strength.get()),
+                ducking_speech_threshold=float(self.ducking_threshold.get()),
+            )
         except (ValueError, RenderError) as exc:
-            messagebox.showerror('Check settings', str(exc) if isinstance(exc, RenderError) else 'Image duration and music gain must be numbers.')
+            messagebox.showerror('Check settings', str(exc) if isinstance(exc, RenderError) else 'Image duration, music gain, transition duration, overlay times/size, and ducking values must be numbers.')
             return
         # Snapshot all Tk variables here; the worker never reads any Tk state.
         tool_folder = self.tools_dir.get().strip()

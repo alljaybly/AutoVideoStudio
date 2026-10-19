@@ -5,7 +5,7 @@ an atomic no-replace operation after FFprobe AND full decode verification.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import json
 import logging
@@ -37,6 +37,22 @@ class Cancelled(RenderError):
 
 
 @dataclass(frozen=True)
+class Transition:
+    type: str  # 'cut', 'crossfade', 'fade_to_black'
+    duration: float  # seconds
+
+@dataclass(frozen=True)
+class Overlay:
+    content: str
+    start: float  # seconds from start of final video
+    end: float    # seconds from start of final video
+    size: int
+    color: str
+    position: str  # 'top', 'centre', 'bottom'
+    background: bool
+
+
+@dataclass(frozen=True)
 class MediaItem:
     path: Path
     kind: str  # video or image; list order is the exact assembly order
@@ -51,6 +67,11 @@ class RenderOptions:
     aspect: str = 'landscape'
     image_seconds: float = 5.0
     music_volume: float = 0.22
+    transitions: tuple[Transition, ...] = field(default_factory=tuple)
+    overlays: tuple[Overlay, ...] = field(default_factory=tuple)
+    ducking: bool = False
+    ducking_strength: float = 0.25
+    ducking_speech_threshold: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -152,6 +173,47 @@ def validate_options(options: RenderOptions) -> None:
         Path(test).unlink()
     except OSError as exc:
         raise RenderError('The destination folder is not writable. Choose another folder.') from exc
+    # Validate transitions: one slot per gap between visuals. An empty tuple
+    # means plain cuts; otherwise exactly N-1 entries are required so each
+    # gap has an explicit behaviour (use 'cut' for a hard cut).
+    valid_types = {'cut', 'crossfade', 'fade_to_black'}
+    if options.transitions and len(options.transitions) != max(0, len(options.items) - 1):
+        raise RenderError('Transitions must cover every gap: supply one per join (N-1), or none for plain cuts.')
+    for t in options.transitions:
+        if t.type not in valid_types:
+            raise RenderError(f'Unknown transition type: {t.type!r}. Choose cut, crossfade, or fade_to_black.')
+        if t.type == 'cut':
+            continue
+        if not math.isfinite(t.duration) or not 0.1 <= t.duration <= 5.0:
+            raise RenderError('Transition duration must be between 0.1 and 5.0 seconds.')
+    # Validate overlays
+    for o in options.overlays:
+        if not o.content.strip():
+            raise RenderError('Overlay text must not be empty.')
+        if len(o.content) > 200:
+            raise RenderError('Overlay text must be 200 characters or fewer.')
+        if not math.isfinite(o.start) or not math.isfinite(o.end):
+            raise RenderError('Overlay start/end times must be numbers.')
+        if o.start < 0:
+            raise RenderError('Overlay start time must be non-negative.')
+        if o.end <= o.start:
+            raise RenderError('Overlay end time must be after start time.')
+        if not math.isfinite(o.size) or not 8 <= o.size <= 200:
+            raise RenderError('Overlay font size must be between 8 and 200.')
+        if o.position not in {'top', 'centre', 'bottom'}:
+            raise RenderError('Overlay position must be top, centre, or bottom.')
+        if not re.fullmatch(r'#[0-9a-fA-F]{6}', o.color or ''):
+            raise RenderError('Overlay colour must be hex like #FFFFFF.')
+    # Validate ducking: strength is the music level kept during speech.
+    if options.ducking:
+        if not options.music:
+            raise RenderError('Audio ducking needs background music. Add music or turn ducking off.')
+        if not options.narration:
+            raise RenderError('Audio ducking needs narration as the speech source. Add narration or turn ducking off.')
+        if not math.isfinite(options.ducking_strength) or not 0.05 <= options.ducking_strength <= 0.9:
+            raise RenderError('Ducking strength must be between 0.05 and 0.9.')
+        if not math.isfinite(options.ducking_speech_threshold) or not 0.005 <= options.ducking_speech_threshold <= 0.5:
+            raise RenderError('Ducking speech threshold must be between 0.005 and 0.5.')
 
 
 def ensure_space(folder: Path, seconds: float) -> int:
@@ -347,6 +409,195 @@ class Renderer:
         return ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-maxrate', '4000k',
                 '-bufsize', '8000k', '-threads', '2', '-pix_fmt', 'yuv420p']
 
+    @staticmethod
+    def _transition_offsets(visual_durations, transitions, cut_cost=0.0):
+        """Return (offsets, total) for chained xfade joins.
+
+        Offsets follow FFmpeg xfade semantics: each offset is relative to
+        the running mixed timeline, and each crossfade/fade-to-black of
+        duration d shortens the total by d. Plain cuts cost ``cut_cost``
+        seconds (0 for pure-concat joins; 1/FPS for the single-frame fade
+        used to express a hard cut inside an xfade chain).
+        """
+        offsets: list[float | None] = []
+        running = float(visual_durations[0]) if visual_durations else 0.0
+        for index, transition in enumerate(transitions):
+            kind = transition.type
+            if kind == 'cut':
+                offsets.append(None)
+                running += float(visual_durations[index + 1]) - cut_cost
+                continue
+            duration = float(transition.duration)
+            offset = running - duration
+            offsets.append(max(0.0, offset))
+            running = offset + float(visual_durations[index + 1])
+        return offsets, running
+
+    @staticmethod
+    def _joined_segment_starts(visual_durations, transitions, cut_cost=0.0):
+        """Start time of each segment on the joined timeline."""
+        starts = [0.0]
+        running = float(visual_durations[0]) if visual_durations else 0.0
+        for index, transition in enumerate(transitions):
+            if transition.type == 'cut':
+                starts.append(running - cut_cost)
+                running += float(visual_durations[index + 1]) - cut_cost
+            else:
+                offset = running - float(transition.duration)
+                starts.append(offset)
+                running = offset + float(visual_durations[index + 1])
+        return starts
+
+    @staticmethod
+    def _escape_drawtext_text(text: str) -> str:
+        return (text.replace('\\', '\\\\').replace("'", "\\'").replace(':', '\\:')
+                    .replace(',', '\\,').replace('\n', ' ').replace('\r', ' '))
+
+    @staticmethod
+    def _overlay_font() -> str | None:
+        candidates = []
+        if os.name == 'nt':
+            candidates += [Path(r'C:\Windows\Fonts\arial.ttf'), Path(r'C:\Windows\Fonts\calibri.ttf')]
+        candidates += [Path('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'),
+                       Path('/usr/share/fonts/dejavu/DejaVuSans.ttf')]
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return str(candidate)
+            except OSError:
+                continue
+        return None
+
+    def _drawtext_filter(self, overlay, y_expr: str, font: str | None, index: int) -> str:
+        parts = []
+        if font:
+            escaped_font = font.replace('\\', '/').replace("'", "\\'").replace(':', '\\:')
+            parts.append(f"fontfile='{escaped_font}'")
+        parts.append(f"text='{self._escape_drawtext_text(overlay.content)}'")
+        parts.append(f'fontsize={int(overlay.size)}')
+        color = (overlay.color or '#FFFFFF').upper()
+        parts.append(f'fontcolor={color}')
+        if overlay.background:
+            parts.append('box=1:boxcolor=black@0.6:boxborderw=12')
+        parts.append('x=(w-text_w)/2')
+        parts.append(f'y={y_expr}')
+        parts.append(f'enable=between(t\\,{overlay.start:.6f}\\,{overlay.end:.6f})')
+        return 'drawtext=' + ':'.join(parts)
+
+    @staticmethod
+    def _parse_silence_intervals(stderr_text: str) -> list[tuple[float, float]]:
+        starts = [float(m.group(1)) for m in re.finditer(r'silence_start:\s*([0-9.]+)', stderr_text)]
+        ends = [float(m.group(1)) for m in re.finditer(r'silence_end:\s*([0-9.]+)', stderr_text)]
+        intervals = []
+        for start, end in zip(starts, ends):
+            if math.isfinite(start) and math.isfinite(end) and end > start:
+                intervals.append((start, end))
+        return intervals
+
+    @staticmethod
+    def _speech_from_silences(duration: float, silences: list[tuple[float, float]],
+                              pad_start: float = 0.1, pad_release: float = 0.25) -> list[tuple[float, float]]:
+        """Invert silence intervals into padded speech segments."""
+        speech: list[tuple[float, float]] = []
+        cursor = 0.0
+        for start, end in sorted(silences):
+            seg_start = max(0.0, cursor - pad_start)
+            seg_end = min(duration, start + pad_release)
+            if seg_end > seg_start:
+                if speech and seg_start <= speech[-1][1] + 0.05:
+                    speech[-1] = (speech[-1][0], max(speech[-1][1], seg_end))
+                else:
+                    speech.append((seg_start, seg_end))
+            cursor = end
+        tail_start = max(0.0, cursor - pad_start)
+        if duration > tail_start + 0.05:
+            if speech and tail_start <= speech[-1][1] + 0.05:
+                speech[-1] = (speech[-1][0], duration)
+            else:
+                speech.append((tail_start, duration))
+        return [(round(s, 3), round(e, 3)) for s, e in speech if e - s >= 0.1]
+
+    def _speech_segments(self, narration: Path, workspace: Path, threshold: float) -> list[tuple[float, float]]:
+        """Detect speech segments in narration via silencedetect.
+
+        Falls back to ducking the whole narration span when detection is
+        inconclusive, so speech is never left unducked silently.
+        """
+        try:
+            info = self.probe(narration)
+            duration = info.duration if info.duration > 0 else 0.0
+        except RenderError:
+            duration = 0.0
+        level = max(-60.0, min(-5.0, 20.0 * math.log10(max(1e-4, float(threshold)))))
+        try:
+            proc = subprocess.run(
+                [self.tools.ffmpeg, '-hide_banner', '-nostdin', '-i', str(narration),
+                 '-vn', '-af', f'silencedetect=noise={level:.1f}dB:d=0.3', '-f', 'null', '-'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                timeout=120, creationflags=NO_WINDOW)
+            silences = self._parse_silence_intervals(proc.stderr or '')
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RenderError('Audio ducking could not analyse the narration track.') from exc
+        speech = self._speech_from_silences(duration, silences) if duration > 0 else []
+        if not speech and duration > 0:
+            speech = [(0.0, round(duration, 3))]
+        return speech
+
+    @staticmethod
+    def _duck_volume_expression(speech: list[tuple[float, float]], total: float, duck_level: float) -> str:
+        """Build a volume argument: full level normally, duck_level in speech.
+
+        Each speech segment contributes a mask with 0.15s linear ramps at
+        both edges; masks are summed and clamped to 1 so overlapping
+        segments cannot over-duck. Returned with single quotes so the
+        commas survive FFmpeg filter parsing.
+        """
+        duck = max(0.05, min(0.9, float(duck_level)))
+        masks = []
+        for start, end in speech:
+            s = max(0.0, min(float(start), total))
+            e = max(0.0, min(float(end), total))
+            if e - s >= 0.05:
+                masks.append(f'clip((t-{s:.3f})/0.150\\,0\\,1)*clip(({e:.3f}-t)/0.150\\,0\\,1)')
+        if not masks:
+            return '1'
+        summed = '+'.join(f'({m})' for m in masks)
+        return f'1-(1-{duck:.4f})*min(({summed})\\,1)'
+
+    @staticmethod
+    def _expected_visual_total(visual_durations, transitions) -> float:
+        """Joined visual duration: crossfades overlap, fade-through-black adds black, cuts concatenate."""
+        total = sum(visual_durations)
+        for n, t in enumerate(transitions or ()):
+            if n >= len(visual_durations) - 1:
+                break
+            if t.type == 'crossfade':
+                total -= min(t.duration, visual_durations[n] / 2.0, visual_durations[n + 1] / 2.0)
+            elif t.type == 'fade_to_black':
+                total += t.duration
+        return max(0.0, total)
+
+    @staticmethod
+    def _build_transition_filter_chain(visual_durations, transitions, width, height):
+        """Describe the join as data: list of (kind, gap_index, seconds).
+
+        The actual filter graph is built by _join_segments which needs the
+        segment file paths. This helper stays pure for unit testing.
+        """
+        if not transitions or len(visual_durations) < 2:
+            return []
+        plan = []
+        for n, t in enumerate(transitions):
+            if n >= len(visual_durations) - 1:
+                break
+            if t.type == 'cut':
+                plan.append(('cut', n, 0.0))
+            elif t.type == 'crossfade':
+                plan.append(('crossfade', n, min(t.duration, visual_durations[n] / 2.0, visual_durations[n + 1] / 2.0)))
+            elif t.type == 'fade_to_black':
+                plan.append(('fade_to_black', n, t.duration))
+        return plan
+
     def verify_output(self, path: Path, workspace: Path, expected: float, size: tuple[int, int]) -> MediaInfo:
         if not path.is_file() or path.stat().st_size == 0:
             raise RenderError('Rendering produced no usable output file.')
@@ -436,12 +687,70 @@ class Renderer:
                         raise RenderError(f'Visual {n+1} could not be normalized; no media was skipped.')
                     total_visual += normalized.duration
                     timeline_offset += normalized.duration
-                concat = workspace / 'segments.txt'
-                concat.write_text(''.join(f"file 'segment{n:05d}.mp4'\n" for n in range(len(options.items))), encoding='ascii')
+                # Join prepared visuals. Plain cuts keep the original fast
+                # stream-copy concat; any crossfade/fade-to-black uses an
+                # xfade filter chain (re-encode) with the overlap subtracted
+                # from the timeline. Clip-audio offsets below are mapped onto
+                # the joined timeline so speech stays in sync with pictures.
+                transitions = list(options.transitions) if options.transitions else []
+                needs_xfade = any(t.type in {'crossfade', 'fade_to_black'} for t in transitions)
+                visual_durations: list[float] = []
+                for n in range(len(options.items)):
+                    probe_seg = self.probe(workspace / f'segment{n:05d}.mp4')
+                    visual_durations.append(probe_seg.duration if probe_seg.duration > 0 else 0.0)
+                join_offsets: list[float | None] = [None] * max(0, len(options.items) - 1)
+                if needs_xfade:
+                    for i, t in enumerate(transitions):
+                        if t.type in {'crossfade', 'fade_to_black'}:
+                            left = visual_durations[i] if i < len(visual_durations) else 0.0
+                            right = visual_durations[i + 1] if i + 1 < len(visual_durations) else 0.0
+                            if t.duration >= min(left, right):
+                                raise RenderError(
+                                    f'Transition {i+1} ({t.duration:g}s) is longer than a neighbouring visual '
+                                    f'({min(left, right):.2f}s). Shorten the transition or lengthen the visuals.')
+                    join_offsets, total_visual = self._transition_offsets(visual_durations, transitions)
                 joined = workspace / 'joined.mp4'
-                self._ffmpeg(['-f', 'concat', '-safe', '1', '-i', str(concat), '-map', '0:v:0',
-                              '-c:v', 'copy', '-an', '-map_metadata', '-1', '-y', str(joined)],
-                             workspace, 'Joining prepared visuals', total_visual)
+                if not needs_xfade:
+                    concat = workspace / 'segments.txt'
+                    concat.write_text(''.join(f"file 'segment{n:05d}.mp4'\n" for n in range(len(options.items))), encoding='ascii')
+                    self._ffmpeg(['-f', 'concat', '-safe', '1', '-i', str(concat), '-map', '0:v:0',
+                                  '-c:v', 'copy', '-an', '-map_metadata', '-1', '-y', str(joined)],
+                                 workspace, 'Joining prepared visuals', total_visual)
+                else:
+                    join_inputs: list[str] = []
+                    for n in range(len(options.items)):
+                        join_inputs += ['-i', str(workspace / f'segment{n:05d}.mp4')]
+                    # Chain xfade joins. Each step normalises the incoming
+                    # segment, then mixes it at the running offset. For hard
+                    # cuts inside a mixed chain, a single-frame fade at the
+                    # exact boundary behaves as a cut.
+                    chain = '[0:v:0]setpts=PTS-STARTPTS,fps=24,format=yuv420p[mix0]'
+                    label = 'mix0'
+                    running = float(visual_durations[0]) if visual_durations else 0.0
+                    for i, transition in enumerate(transitions):
+                        nxt = f'mix{i+1}'
+                        dur_next = float(visual_durations[i + 1])
+                        if transition.type == 'cut':
+                            cut_dur = 1.0 / FPS
+                            cut_offset = running - cut_dur
+                            chain += (f';[{i+1}:v:0]setpts=PTS-STARTPTS,fps=24,format=yuv420p[x{i}];'
+                                      f'[{label}][x{i}]xfade=transition=fade:duration={cut_dur:.6f}:offset={cut_offset:.6f}[{nxt}]')
+                            running = running - cut_dur + dur_next
+                        else:
+                            d = float(transition.duration)
+                            kind = 'fade' if transition.type == 'crossfade' else 'fadeblack'
+                            offset = running - d
+                            chain += (f';[{i+1}:v:0]setpts=PTS-STARTPTS,fps=24,format=yuv420p[x{i}];'
+                                      f'[{label}][x{i}]xfade=transition={kind}:duration={d:.6f}:offset={offset:.6f}[{nxt}]')
+                            running = offset + dur_next
+                        label = nxt
+                    # Recompute the joined total from the same accumulation so
+                    # audio offsets and verification share one timeline.
+                    total_visual = running
+                    chain += f';[{label}]setpts=PTS-STARTPTS,fps=24,format=yuv420p[joinout]'
+                    self._ffmpeg([*join_inputs, '-filter_complex', chain, '-map', '[joinout]',
+                                  '-map_metadata', '-1', *self._encoding(), '-an', '-y', str(joined)],
+                                 workspace, 'Joining prepared visuals with transitions', total_visual)
                 total = max(total_visual, narration.duration if narration else 0)
                 ensure_space(options.output.parent, total)  # conservative second check
                 staged = workspace / 'verified-output.mp4'
@@ -454,24 +763,79 @@ class Renderer:
                     audio_filters.append(f'[{next_input}:a:0]aresample=48000,aformat=channel_layouts=stereo,apad,atrim=duration={total:.6f},asetpts=PTS-STARTPTS[narration]')
                     audio_labels.append('[narration]')
                     next_input += 1
+                # Music chain is named 'musicbase' so ducking can insert a
+                # sidechain stage before the final mix without touching the
+                # narration/clip/limiter path.
+                music_label = 'music'
                 if options.music:
                     args += ['-stream_loop', '-1', '-i', str(options.music.resolve())]
-                    audio_filters.append(f'[{next_input}:a:0]aresample=48000,aformat=channel_layouts=stereo,volume={options.music_volume:.6f},apad,atrim=duration={total:.6f},asetpts=PTS-STARTPTS[music]')
-                    audio_labels.append('[music]')
+                    audio_filters.append(f'[{next_input}:a:0]aresample=48000,aformat=channel_layouts=stereo,volume={options.music_volume:.6f},apad,atrim=duration={total:.6f},asetpts=PTS-STARTPTS[musicbase]')
+                    audio_labels.append('[musicbase]')
                     next_input += 1
+                # Map clip-audio offsets from the pre-join timeline onto the
+                # joined (possibly overlap-shortened) timeline.
+                cut_cost = (1.0 / FPS) if needs_xfade else 0.0
+                joined_starts = self._joined_segment_starts(visual_durations, transitions, cut_cost) if needs_xfade else None
+                prejoin_starts: list[float] = []
+                acc = 0.0
+                for n, item in enumerate(options.items):
+                    prejoin_starts.append(acc)
+                    if n < len(visual_durations):
+                        acc += visual_durations[n]
                 for clip_index, (clip_path, offset, duration) in enumerate(audio_clips):
+                    seg = 0
+                    for n, start in enumerate(prejoin_starts):
+                        end = start + (visual_durations[n] if n < len(visual_durations) else 0.0)
+                        if offset + 1e-6 >= start and offset < end:
+                            seg = n
+                    joined_offset = (joined_starts[seg] + (offset - prejoin_starts[seg])) if joined_starts else offset
+                    joined_offset = max(0.0, joined_offset)
                     args += ['-i', str(clip_path.resolve())]
                     label = f'clipaudio{clip_index}'
-                    audio_filters.append(f'[{next_input}:a:0]aresample=48000,aformat=channel_layouts=stereo,atrim=duration={duration:.6f},asetpts=PTS-STARTPTS,adelay={round(offset * 1000)}:all=1,apad,atrim=duration={total:.6f}[{label}]')
+                    audio_filters.append(f'[{next_input}:a:0]aresample=48000,aformat=channel_layouts=stereo,atrim=duration={duration:.6f},asetpts=PTS-STARTPTS,adelay={round(joined_offset * 1000)}:all=1,apad,atrim=duration={total:.6f}[{label}]')
                     audio_labels.append(f'[{label}]')
                     next_input += 1
                 if audio_labels:
+                    # Optional speech ducking: measure speech segments in the
+                    # narration track with silencedetect, then duck the music
+                    # bus with timed volume automation. Narration, clip audio
+                    # and the limiter path are untouched.
+                    if options.ducking and options.music and options.narration:
+                        speech = self._speech_segments(options.narration, workspace, options.ducking_speech_threshold)
+                        threshold = max(0.001, min(1.0, float(options.ducking_speech_threshold)))
+                        music_label = 'musicducked'
+                        duck_expr = self._duck_volume_expression(speech, total, float(options.ducking_strength))
+                        # eval=frame so the time-varying expression updates;
+                        # the default (once) would freeze music at one level.
+                        audio_filters.append(f'[musicbase]volume={duck_expr}:eval=frame[musicducked]')
+                        audio_labels = [a for a in audio_labels if a != '[musicbase]']
+                        audio_labels.append('[musicducked]')
+                        self.logger.info('ducking speech_segments=%d threshold=%s', len(speech), threshold)
+                    else:
+                        # Non-ducking path keeps the historical label so the
+                        # filter graph is unchanged for existing renders.
+                        if options.music:
+                            audio_filters.append('[musicbase]anull[music]')
+                            audio_labels = ['[music]' if a == '[musicbase]' else a for a in audio_labels]
                     audio = ';'.join(audio_filters) + ';' + ''.join(audio_labels) + f'amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=0:normalize=0,alimiter=limit=0.95:level=0:latency=1[aout]'
                     args += ['-filter_complex', audio, '-map', '0:v:0', '-map', '[aout]']
                 else:
                     args += ['-map', '0:v:0', '-an']
+                # Timed text overlays (drawtext) ride on the final video
+                # filter together with the hold-last-frame pad.
+                video_filters = [f'tpad=stop_mode=clone:stop_duration={max(0, total-total_visual)+0.1:.6f}']
+                if options.overlays:
+                    font = self._overlay_font()
+                    for index, overlay in enumerate(options.overlays):
+                        if overlay.start >= total:
+                            continue
+                        end = min(overlay.end, total)
+                        if end <= overlay.start:
+                            continue
+                        y_expr = {'top': 'h*0.08', 'centre': '(h-text_h)/2', 'bottom': 'h-h*0.08-text_h'}[overlay.position]
+                        video_filters.append(self._drawtext_filter(overlay, y_expr, font, index))
                 args += [
-                         '-vf', f'tpad=stop_mode=clone:stop_duration={max(0, total-total_visual)+0.1:.6f}',
+                         '-vf', ','.join(video_filters),
                          '-t', f'{total:.6f}', '-map_metadata', '-1']
                 args += self._encoding() + ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
                                            '-movflags', '+faststart', '-y', str(staged)]
