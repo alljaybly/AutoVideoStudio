@@ -5,7 +5,7 @@ A fast, offline Windows desktop app that assembles your selected clips and still
 ## Quick Start (Zero-Install)
 
 1. Download the AutoVideo Studio ZIP and extract the whole `AutoVideoStudio` folder somewhere writable, such as `Documents` or your Desktop. Do not run it from inside the ZIP.
-2. Double-click the **AutoVideo Studio** shortcut (the custom icon). 
+2.Double-click the **AutoVideo Studio.vbs** file to launch the app. 
 3. The app opens instantly. No Python installation, no setup, and no black command boxes.
 
 *(Note: If Windows Defender shows a warning when you first open the app, this is a standard security prompt for downloaded ZIP files. Click "More info" and "Run anyway".)*
