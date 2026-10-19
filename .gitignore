@@ -21,9 +21,17 @@ tools/**/*.dll
 *.mp3
 *.m4a
 *.log
+*.zip
 gui-feature-review.png
 _dbg.py
 _measure*.py
 _snapshot.py
 _verify_gui.py
 tools/ffmpeg/
+runtime/
+AutoVideoStudio-Portable-FINAL.zip
+python-embed.zip
+# Ignore build artifacts and local launchers
+AutoVideoStudio-Portable-FINAL/
+*.zip
+AutoVideo Studio.lnk
